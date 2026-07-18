@@ -1,0 +1,50 @@
+{
+  "name": "pi-claude-runtime",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Run Claude Code inside Pi through Anthropic's official Agent SDK runtime",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/m7l5/pi-claude-runtime.git"
+  },
+  "homepage": "https://github.com/m7l5/pi-claude-runtime#readme",
+  "bugs": {
+    "url": "https://github.com/m7l5/pi-claude-runtime/issues"
+  },
+  "keywords": [
+    "anthropic",
+    "claude",
+    "claude-code",
+    "pi-extension",
+    "pi-package"
+  ],
+  "files": [
+    "index.ts",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.170"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "devDependencies": {
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}

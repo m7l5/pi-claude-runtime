@@ -39,9 +39,34 @@ const entryToMessage = (entry: SessionEntry): AgentMessage | undefined => {
 
 export type HandoffRange = {
   messages: AgentMessage[];
+  /**
+   * The missed range without compaction canonicalization. Compaction entries
+   * appear as compactionSummary messages alongside the raw messages they
+   * summarize (which stay in the branch), so callers can inspect what the
+   * range actually contains.
+   */
+  rawMessages: AgentMessage[];
   throughEntryId?: string;
   divergent: boolean;
 };
+
+/**
+ * Whether the missed range carries information Claude's own session lacks.
+ * Rounds and tool results produced by the Claude runtime are already in
+ * Claude's session. Compaction summaries only re-describe raw entries that
+ * remain in the branch, so they are ignored here — the raw foreign messages
+ * themselves trip the check. Branch summaries are the sole record of another
+ * branch and do need handing off.
+ */
+export function needsClaudeHandoff(rawMessages: AgentMessage[], claudeProvider: string): boolean {
+  return rawMessages.some(
+    (message) =>
+      message.role === "user" ||
+      message.role === "branchSummary" ||
+      (message.role === "assistant" &&
+        (message as { provider?: string }).provider !== claudeProvider),
+  );
+}
 
 export function getHandoffRange(
   branch: SessionEntry[],
@@ -80,8 +105,9 @@ export function getHandoffRange(
   }
 
   const messages = canonical.map(entryToMessage).filter((message) => message !== undefined);
+  const rawMessages = segment.map(entryToMessage).filter((message) => message !== undefined);
   const throughEntryId = safeEnd > 0 ? branch[safeEnd - 1]?.id : undefined;
-  return { messages, throughEntryId, divergent };
+  return { messages, rawMessages, throughEntryId, divergent };
 }
 
 export const serializeHandoff = (messages: AgentMessage[]): string =>

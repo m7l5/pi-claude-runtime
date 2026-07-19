@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { getHandoffRange, wrapHandoff } from "../src/handoff.js";
+import { getHandoffRange, needsClaudeHandoff, wrapHandoff } from "../src/handoff.js";
 
 const user = (id: string, text: string) => ({
   type: "message",
@@ -64,4 +64,68 @@ test("wraps a one-time handoff with an auditable Pi entry cursor", () => {
   const value = wrapHandoff("state", "catch-up", "abc", "continue");
   assert.match(value, /kind="catch-up" through_entry="abc"/);
   assert.match(value, /## Current request\ncontinue/);
+});
+
+const claudeAssistant = (id: string, text: string) => {
+  const entry = assistant(id, text);
+  entry.message.provider = "claude-runtime";
+  return entry;
+};
+
+const toolResult = (id: string) => ({
+  type: "message",
+  id,
+  parentId: null,
+  timestamp: "2026-01-01T00:00:00.000Z",
+  message: { role: "toolResult", toolCallId: "t1", toolName: "Bash", content: [], timestamp: 3 },
+}) as any;
+
+const compaction = (id: string, firstKeptEntryId: string) => ({
+  type: "compaction",
+  id,
+  parentId: null,
+  timestamp: "2026-01-01T00:00:00.000Z",
+  summary: "summary",
+  firstKeptEntryId,
+  tokensBefore: 100,
+}) as any;
+
+test("pi compaction of pure claude-runtime history needs no handoff", () => {
+  const branch = [
+    user("a", "turn"),
+    claudeAssistant("b", "round 1"),
+    toolResult("c"),
+    claudeAssistant("d", "round 2"),
+    compaction("e", "d"),
+  ];
+  const result = getHandoffRange(branch, "a");
+  assert.equal(needsClaudeHandoff(result.rawMessages, "claude-runtime"), false);
+  // Canonical view still carries the compaction summary for actual handoffs.
+  assert.equal(result.messages.some((message: any) => message.role === "compactionSummary"), true);
+});
+
+test("foreign content behind a compaction summary still needs handoff", () => {
+  const branch = [
+    claudeAssistant("a", "synced"),
+    assistant("b", "gpt answer"),
+    compaction("c", "b"),
+  ];
+  const result = getHandoffRange(branch, "a");
+  assert.equal(needsClaudeHandoff(result.rawMessages, "claude-runtime"), true);
+});
+
+test("user messages and branch summaries need handoff; claude rounds do not", () => {
+  assert.equal(needsClaudeHandoff([{ role: "user", content: "hi", timestamp: 1 } as any], "claude-runtime"), true);
+  assert.equal(
+    needsClaudeHandoff(
+      [{ role: "branchSummary", summary: "s", fromId: "x", timestamp: 1 } as any],
+      "claude-runtime",
+    ),
+    true,
+  );
+  const claudeOnly = getHandoffRange(
+    [user("a", "turn"), claudeAssistant("b", "round"), toolResult("c")],
+    "a",
+  );
+  assert.equal(needsClaudeHandoff(claudeOnly.rawMessages, "claude-runtime"), false);
 });

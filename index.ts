@@ -10,7 +10,13 @@ import {
   DynamicBorder,
   type ExtensionAPI,
   type ExtensionContext,
+  generateDiffString,
+  keyHint,
+  renderDiff,
+  type Theme,
+  type ToolDefinition,
   ToolExecutionComponent,
+  truncateToVisualLines,
 } from "@earendil-works/pi-coding-agent";
 import {
   type Api,
@@ -21,11 +27,20 @@ import {
   type Model,
   type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
-import { Container, type SelectItem, SelectList, Text, type TUI } from "@earendil-works/pi-tui";
+import {
+  Container,
+  type SelectItem,
+  SelectList,
+  Spacer,
+  Text,
+  truncateToWidth,
+  type TUI,
+} from "@earendil-works/pi-tui";
 import { CLAUDE_RUNTIME_MODELS } from "./src/models.js";
 import {
   generateHandoffSummary,
   getHandoffRange,
+  needsClaudeHandoff,
   wrapHandoff,
 } from "./src/handoff.js";
 import {
@@ -35,14 +50,24 @@ import {
 } from "./src/maintenance.js";
 import {
   type Activity,
+  AsyncQueue,
+  CLAUDE_TOOL_NAMES,
   DEFAULT_STATE,
+  type Deferred,
+  deferred,
+  drainRound,
   effortFor,
   lastUserContent,
   lastUserText,
   type PendingHandoff,
+  type RunEvent,
   type RuntimeState,
+  type SdkToolOutcome,
+  structuredPatchFromToolUseResult,
+  structuredPatchToDiffString,
   summarize,
   thinkingFor,
+  toolResultContent,
 } from "./src/runtime.js";
 
 const PROVIDER = "claude-runtime";
@@ -57,9 +82,11 @@ type ActivityInput = Activity extends infer Item
     : never
   : never;
 
-type InternalBlock =
-  | { type: "text"; text: string; providerIndex: number }
-  | { type: "thinking"; thinking: string; thinkingSignature: string; providerIndex: number };
+const displayPath = (value: unknown): string => {
+  const raw = typeof value === "string" ? value : "";
+  const home = process.env.HOME;
+  return home && raw.startsWith(home) ? `~${raw.slice(home.length)}` : raw;
+};
 
 const toPiTool = (name: string, args: Record<string, unknown>) => {
   switch (name) {
@@ -211,136 +238,213 @@ export default function claudeRuntime(pi: ExtensionAPI) {
     };
   };
 
-  const streamClaudeRuntime = (
-    model: Model<Api>,
-    context: Context,
-    options?: SimpleStreamOptions,
-  ): AssistantMessageEventStream => {
-    const stream = createAssistantMessageEventStream();
-    const output = makeOutput(model);
+  // ----- Claude runtime run state -----
+  // A "run" is one Claude Code query. It spans several Pi turns: each round of
+  // thinking/text ends with stopReason "toolUse" when Claude issues tool calls,
+  // Pi "executes" the proxy tools below (which merely await Claude's own
+  // results), and the next streamSimple call drains the following round.
+  type ActiveRun = {
+    piSessionId: string;
+    abortController: AbortController;
+    events: AsyncQueue<RunEvent>;
+    pendingResults: Map<string, Deferred<SdkToolOutcome>>;
+    earlyResults: Map<string, SdkToolOutcome>;
+  };
+  let activeRun: ActiveRun | undefined;
 
+  const awaitClaudeToolResult = (toolCallId: string, signal?: AbortSignal): Promise<SdkToolOutcome> => {
+    const run = activeRun;
+    if (!run) {
+      return Promise.resolve({
+        content: [{ type: "text", text: "The Claude runtime run is not active." }],
+        details: undefined,
+        isError: true,
+      });
+    }
+    const early = run.earlyResults.get(toolCallId);
+    if (early) {
+      run.earlyResults.delete(toolCallId);
+      return Promise.resolve(early);
+    }
+    const waiter = deferred<SdkToolOutcome>();
+    run.pendingResults.set(toolCallId, waiter);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        if (run.pendingResults.delete(toolCallId)) {
+          waiter.resolve({ content: [{ type: "text", text: "Aborted." }], details: undefined, isError: true });
+        }
+      },
+      { once: true },
+    );
+    return waiter.promise;
+  };
+
+  const proxyHeader =
+    (title: string, detail: (args: Record<string, any>) => string) =>
+    (args: Record<string, any>, theme: Theme) =>
+      new Text(`${theme.fg("toolTitle", theme.bold(title))} ${detail(args ?? {})}`.trimEnd(), 0, 0);
+
+  const PROXY_PREVIEW_LINES = 5;
+
+  // Ctrl+O support: mirror native bash's collapsed rendering — last N visual
+  // lines plus an expand hint — since the generic result fallback ignores the
+  // expanded flag entirely and would dump full output with no way to collapse.
+  const proxyResultRenderer = (
+    result: { content: Array<{ type: string; text?: string }> },
+    options: { expanded?: boolean },
+    theme: Theme,
+    context: { isError: boolean },
+  ) => {
+    const container = new Container();
+    const text = result.content
+      .filter((block) => block.type === "text")
+      .map((block) => block.text ?? "")
+      .join("\n")
+      .replace(/\r/g, "")
+      .trim();
+    if (!text) return container;
+    const styled = text
+      .split("\n")
+      .map((line) => theme.fg(context.isError ? "error" : "toolOutput", line))
+      .join("\n");
+    if (options.expanded === true) {
+      container.addChild(new Spacer(1));
+      container.addChild(new Text(styled, 0, 0));
+      return container;
+    }
+    let cached: { width: number; lines: string[]; skipped: number } | undefined;
+    container.addChild({
+      render: (width: number) => {
+        if (cached === undefined || cached.width !== width) {
+          const preview = truncateToVisualLines(styled, PROXY_PREVIEW_LINES, width);
+          cached = { width, lines: preview.visualLines, skipped: preview.skippedCount };
+        }
+        if (cached.skipped > 0) {
+          const hint =
+            theme.fg("muted", `... (${String(cached.skipped)} earlier lines,`) +
+            ` ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`;
+          return ["", truncateToWidth(hint, width, "..."), ...cached.lines];
+        }
+        return ["", ...cached.lines];
+      },
+      invalidate: () => {
+        cached = undefined;
+      },
+    });
+    return container;
+  };
+
+  const editProxyRenderers = {
+    renderCall: proxyHeader("edit", (args) => displayPath(args.file_path)),
+    renderResult: (
+      result: { content: Array<{ type: string; text?: string }>; details?: unknown },
+      _options: unknown,
+      theme: Theme,
+      context: { args?: Record<string, any>; isError: boolean },
+    ) => {
+      const container = new Container();
+      if (context.isError) {
+        const text = result.content
+          .filter((block) => block.type === "text")
+          .map((block) => block.text ?? "")
+          .join("\n");
+        if (text) {
+          container.addChild(new Spacer(1));
+          container.addChild(new Text(theme.fg("error", text), 0, 0));
+        }
+        return container;
+      }
+      const args = context.args ?? {};
+      const patch = structuredPatchFromToolUseResult(result.details, args.file_path);
+      const diff = patch
+        ? structuredPatchToDiffString(patch)
+        : typeof args.old_string === "string" && typeof args.new_string === "string"
+          ? generateDiffString(args.old_string, args.new_string).diff
+          : undefined;
+      if (diff) {
+        container.addChild(new Spacer(1));
+        container.addChild(new Text(renderDiff(diff), 0, 0));
+      }
+      return container;
+    },
+  };
+
+  const PROXY_RENDERERS: Record<string, { renderCall?: unknown; renderResult?: unknown }> = {
+    Edit: editProxyRenderers,
+    MultiEdit: editProxyRenderers,
+    Bash: { renderCall: proxyHeader("bash", (args) => String(args.command ?? "")) },
+    Read: { renderCall: proxyHeader("read", (args) => displayPath(args.file_path)) },
+    Write: { renderCall: proxyHeader("write", (args) => displayPath(args.file_path)) },
+    Grep: { renderCall: proxyHeader("grep", (args) => String(args.pattern ?? "")) },
+    Glob: { renderCall: proxyHeader("find", (args) => String(args.pattern ?? "")) },
+  };
+
+  const registeredProxies = new Set<string>();
+
+  const claudeProxyTool = (name: string): ToolDefinition<any, any> =>
+    ({
+      name,
+      label: name,
+      description: `${name} runs inside the Claude runtime; Pi mirrors its recorded result.`,
+      parameters: { type: "object", properties: {}, additionalProperties: true },
+      execute: async (toolCallId: string, _params: unknown, signal?: AbortSignal) => {
+        const outcome = await awaitClaudeToolResult(toolCallId, signal);
+        if (outcome.isError) {
+          const text = outcome.content
+            .filter((block): block is { type: "text"; text: string } => block.type === "text")
+            .map((block) => block.text)
+            .join("\n");
+          throw new Error(text || `${name} failed in the Claude runtime.`);
+        }
+        return { content: outcome.content, details: outcome.details };
+      },
+      renderResult: proxyResultRenderer,
+      ...PROXY_RENDERERS[name],
+    }) as unknown as ToolDefinition<any, any>;
+
+  const registerProxy = (name: string) => {
+    if (!name || registeredProxies.has(name)) return;
+    registeredProxies.add(name);
+    pi.registerTool(claudeProxyTool(name));
+  };
+  for (const name of CLAUDE_TOOL_NAMES) registerProxy(name);
+
+  /** Register proxies for tool names discovered at runtime and keep them active. */
+  const rememberClaudeTools = (names: string[]) => {
+    const fresh = names.filter((name) => name && !registeredProxies.has(name));
+    if (fresh.length === 0) return;
+    for (const name of fresh) registerProxy(name);
+    state = { ...state, knownClaudeTools: [...new Set([...(state.knownClaudeTools ?? []), ...fresh])].sort() };
+    persistState();
+    if (activeContext?.model?.provider === PROVIDER) {
+      pi.setActiveTools([...new Set([...pi.getActiveTools(), ...fresh])]);
+    }
+  };
+
+  /** Swap Pi's active tools to the Claude proxies while the runtime drives, and back. */
+  const applyToolScope = (provider: string | undefined) => {
+    if (provider === PROVIDER) {
+      if (state.savedActiveTools === undefined) {
+        const nonProxy = pi.getActiveTools().filter((name) => !registeredProxies.has(name));
+        state = { ...state, savedActiveTools: nonProxy };
+        persistState();
+      }
+      pi.setActiveTools([...registeredProxies]);
+    } else if (state.savedActiveTools !== undefined) {
+      pi.setActiveTools(state.savedActiveTools);
+      state = { ...state, savedActiveTools: undefined };
+      persistState();
+    }
+  };
+
+  const pumpRun = (run: ActiveRun, sdkQuery: AsyncIterable<SDKMessage>, piSessionId: string) => {
     void (async () => {
-      const abortController = new AbortController();
-      const abort = () => abortController.abort();
-      options?.signal?.addEventListener("abort", abort, { once: true });
-      let resultError: string | undefined;
-      let emittedText = false;
+      const pendingTools = new Map<string, { name: string; args: Record<string, unknown> }>();
       const seenToolUses = new Set<string>();
       const seenToolResults = new Set<string>();
-      const pendingTools = new Map<string, { name: string; args: Record<string, unknown> }>();
-      let currentBlocks = new Map<number, number>();
-
       try {
-        const userContent = lastUserContent(context);
-        const promptText = lastUserText(context);
-        if (userContent.length === 0) throw new Error("Claude Agent SDK requires a user prompt.");
-
-        const branch = activeContext?.sessionManager.getBranch() ?? [];
-        const currentUserEntry = [...branch].reverse().find(
-          (entry) => entry.type === "message" && entry.message.role === "user",
-        );
-        const piSessionId = activeContext?.sessionManager.getSessionId() ?? "ephemeral";
-        const bindingMatchesSession =
-          state.binding?.piSessionId === piSessionId && state.binding.cwd === (activeContext?.cwd ?? process.cwd());
-        if (state.binding && !bindingMatchesSession) {
-          state = { ...state, binding: undefined };
-        }
-
-        const range = getHandoffRange(
-          branch,
-          state.binding?.syncedThroughEntryId,
-          currentUserEntry?.id,
-        );
-        if (range.divergent) {
-          state = { ...state, binding: undefined, pendingHandoff: undefined };
-        }
-
-        let handoff: PendingHandoff | undefined = state.pendingHandoff;
-        if (!handoff && range.messages.length > 0) {
-          setRuntimePhase("Claude: preparing handoff");
-          handoff = {
-            kind: state.binding && !range.divergent ? "catch-up" : "bootstrap",
-            summary: await generateHandoffSummary(
-              activeContext!,
-              handoffSourceModel,
-              range.messages,
-              promptText,
-              abortController.signal,
-            ),
-            throughEntryId: range.throughEntryId,
-          };
-          state = { ...state, pendingHandoff: handoff };
-          persistState();
-        }
-
-        const effectiveText = handoff
-          ? wrapHandoff(handoff.summary, handoff.kind, handoff.throughEntryId, promptText)
-          : promptText;
-        const effectiveContent = userContent.map((block, index) =>
-          block.type === "text" && index === userContent.findIndex((item) => item.type === "text")
-            ? { ...block, text: effectiveText }
-            : block,
-        );
-        if (!effectiveContent.some((block) => block.type === "text")) {
-          effectiveContent.unshift({ type: "text", text: effectiveText });
-        }
-        const hasImages = effectiveContent.some((block) => block.type === "image");
-        const prompt = hasImages
-          ? (async function* (): AsyncGenerator<SDKUserMessage> {
-              yield {
-                type: "user",
-                message: {
-                  role: "user",
-                  content: effectiveContent.map((block) =>
-                    block.type === "text"
-                      ? block
-                      : {
-                          type: "image" as const,
-                          source: {
-                            type: "base64" as const,
-                            media_type: block.mimeType as "image/gif" | "image/jpeg" | "image/png" | "image/webp",
-                            data: block.data,
-                          },
-                        },
-                  ),
-                },
-                parent_tool_use_id: null,
-                session_id: "",
-              };
-            })()
-          : effectiveText;
-        stream.push({ type: "start", partial: output });
-        setRuntimePhase(state.binding ? "Claude: resuming" : "Claude: starting");
-
-        const sdkQuery = query({
-          prompt,
-          options: {
-            cwd: activeContext?.cwd ?? process.cwd(),
-            model: model.id,
-            pathToClaudeCodeExecutable: binary,
-            systemPrompt: { type: "preset", preset: "claude_code" },
-            tools: { type: "preset", preset: "claude_code" },
-            settingSources: ["user", "project", "local"],
-            includePartialMessages: true,
-            forwardSubagentText: true,
-            abortController,
-            canUseTool,
-            ...(state.binding ? { resume: state.binding.claudeSessionId } : {}),
-            ...(state.permission === "full-access"
-              ? { permissionMode: "bypassPermissions", allowDangerouslySkipPermissions: true }
-              : { permissionMode: "default" }),
-            ...(effortFor(options?.reasoning) ? { effort: effortFor(options?.reasoning) } : {}),
-            ...(thinkingFor(model.id, options?.reasoning, options?.thinkingBudgets)
-              ? { thinking: thinkingFor(model.id, options?.reasoning, options?.thinkingBudgets) }
-              : {}),
-            env: {
-              ...process.env,
-              CLAUDE_AGENT_SDK_CLIENT_APP: "pi-claude-runtime/0.1.0",
-            },
-          },
-        });
-
-        for await (const message of sdkQuery as AsyncIterable<SDKMessage>) {
+        for await (const message of sdkQuery) {
           if (
             "session_id" in message &&
             message.session_id &&
@@ -357,84 +461,87 @@ export default function claudeRuntime(pi: ExtensionAPI) {
             };
             persistState();
           }
+          const parentToolUseId = (message as { parent_tool_use_id?: string | null }).parent_tool_use_id ?? null;
 
           if (message.type === "stream_event") {
-            const event = message.event as any;
-            if (event.type === "message_start") {
-              currentBlocks = new Map();
-              setRuntimePhase("Claude: thinking");
-            }
-            if (event.type === "content_block_start") {
-              if (event.content_block?.type === "text") {
-                setRuntimePhase("Claude: responding");
-                const index = output.content.length;
-                (output.content as InternalBlock[]).push({ type: "text", text: "", providerIndex: event.index });
-                currentBlocks.set(event.index, index);
-                stream.push({ type: "text_start", contentIndex: index, partial: output });
-              } else if (event.content_block?.type === "thinking") {
-                setRuntimePhase("Claude: thinking");
-                const index = output.content.length;
-                (output.content as InternalBlock[]).push({
-                  type: "thinking",
-                  thinking: "",
-                  thinkingSignature: "",
-                  providerIndex: event.index,
-                });
-                currentBlocks.set(event.index, index);
-                stream.push({ type: "thinking_start", contentIndex: index, partial: output });
-              }
-            } else if (event.type === "content_block_delta") {
-              const index = currentBlocks.get(event.index);
-              const block = index === undefined ? undefined : (output.content[index] as InternalBlock | undefined);
-              if (block?.type === "text" && event.delta?.type === "text_delta") {
-                block.text += event.delta.text;
-                emittedText = true;
-                stream.push({ type: "text_delta", contentIndex: index!, delta: event.delta.text, partial: output });
-              } else if (block?.type === "thinking" && event.delta?.type === "thinking_delta") {
-                block.thinking += event.delta.thinking;
-                stream.push({ type: "thinking_delta", contentIndex: index!, delta: event.delta.thinking, partial: output });
-              } else if (block?.type === "thinking" && event.delta?.type === "signature_delta") {
-                block.thinkingSignature += event.delta.signature;
-              }
-            } else if (event.type === "content_block_stop") {
-              const index = currentBlocks.get(event.index);
-              const block = index === undefined ? undefined : (output.content[index] as InternalBlock | undefined);
-              if (block?.type === "text") {
-                delete (block as { providerIndex?: number }).providerIndex;
-                stream.push({ type: "text_end", contentIndex: index!, content: block.text, partial: output });
-              } else if (block?.type === "thinking") {
-                delete (block as { providerIndex?: number }).providerIndex;
-                stream.push({ type: "thinking_end", contentIndex: index!, content: block.thinking, partial: output });
-              }
-            }
+            if (!parentToolUseId) run.events.push({ kind: "stream_event", event: message.event });
             continue;
           }
 
           if (message.type === "assistant") {
+            const apiUsage = (message.message as any).usage as
+              | {
+                  input_tokens?: number | null;
+                  output_tokens?: number | null;
+                  cache_read_input_tokens?: number | null;
+                  cache_creation_input_tokens?: number | null;
+                }
+              | undefined;
+            if (!parentToolUseId && apiUsage) {
+              // This API call's prompt tokens are Claude's actual context size.
+              run.events.push({
+                kind: "usage",
+                usage: {
+                  input: apiUsage.input_tokens ?? 0,
+                  output: apiUsage.output_tokens ?? 0,
+                  cacheRead: apiUsage.cache_read_input_tokens ?? 0,
+                  cacheWrite: apiUsage.cache_creation_input_tokens ?? 0,
+                },
+              });
+            }
+            const calls: Array<{ id: string; name: string; arguments: Record<string, unknown> }> = [];
             for (const block of message.message.content as any[]) {
               if (block.type !== "tool_use" || seenToolUses.has(block.id)) continue;
               seenToolUses.add(block.id);
               pendingTools.set(block.id, { name: block.name, args: block.input ?? {} });
               setRuntimePhase(`Claude: ${block.name}`);
+              if (!parentToolUseId) calls.push({ id: block.id, name: block.name, arguments: block.input ?? {} });
+            }
+            if (calls.length > 0) {
+              rememberClaudeTools(calls.map((call) => call.name));
+              run.events.push({ kind: "toolcalls", calls });
             }
             if (message.error) activity({ kind: "error", title: `Claude: ${message.error}`, isError: true });
             continue;
           }
 
           if (message.type === "user" && Array.isArray(message.message.content)) {
+            const toolUseResult = (message as { tool_use_result?: unknown }).tool_use_result;
             for (const block of message.message.content as any[]) {
               if (block.type !== "tool_result" || seenToolResults.has(block.tool_use_id)) continue;
               seenToolResults.add(block.tool_use_id);
               const pending = pendingTools.get(block.tool_use_id);
-              activity({
-                kind: "tool",
-                title: pending?.name ?? "Tool",
-                toolUseId: block.tool_use_id,
-                args: pending?.args ?? {},
-                result: summarize(block.content),
-                isError: block.is_error === true,
-              });
               pendingTools.delete(block.tool_use_id);
+              if (parentToolUseId) {
+                // Subagent tools are not part of Pi's turn structure; keep them
+                // as side-channel activity entries.
+                const structuredPatch =
+                  pending?.name === "Edit" && block.is_error !== true
+                    ? structuredPatchFromToolUseResult(toolUseResult, pending.args.file_path)
+                    : undefined;
+                activity({
+                  kind: "tool",
+                  title: pending?.name ?? "Tool",
+                  toolUseId: block.tool_use_id,
+                  args: pending?.args ?? {},
+                  result: summarize(block.content),
+                  isError: block.is_error === true,
+                  ...(structuredPatch ? { details: { structuredPatch } } : {}),
+                });
+                continue;
+              }
+              const outcome: SdkToolOutcome = {
+                content: toolResultContent(block.content),
+                details: toolUseResult,
+                isError: block.is_error === true,
+              };
+              const waiter = run.pendingResults.get(block.tool_use_id);
+              if (waiter) {
+                run.pendingResults.delete(block.tool_use_id);
+                waiter.resolve(outcome);
+              } else {
+                run.earlyResults.set(block.tool_use_id, outcome);
+              }
             }
             continue;
           }
@@ -444,34 +551,243 @@ export default function claudeRuntime(pi: ExtensionAPI) {
             continue;
           }
 
-          if (message.type === "system" && message.subtype !== "init") {
-            const systemMessage = message as any;
-            const label = systemMessage.summary ?? systemMessage.description ?? systemMessage.text;
-            if (label) setRuntimePhase(`Claude: ${summarize(label, 60)}`);
+          if (message.type === "system") {
+            if (message.subtype === "init") {
+              rememberClaudeTools((message as { tools?: string[] }).tools ?? []);
+            } else if (message.subtype === "compact_boundary") {
+              const metadata = (message as any).compact_metadata ?? {};
+              const tokens =
+                typeof metadata.pre_tokens === "number"
+                  ? ` (${Math.round(metadata.pre_tokens / 1000)}k${
+                      typeof metadata.post_tokens === "number"
+                        ? ` → ${Math.round(metadata.post_tokens / 1000)}k`
+                        : ""
+                    } tokens)`
+                  : "";
+              activity({
+                kind: "status",
+                title: `Claude compacted its context${metadata.trigger === "auto" ? " automatically" : ""}${tokens}`,
+              });
+              setRuntimePhase("Claude: continuing");
+            } else if (message.subtype === "status") {
+              const statusMessage = message as any;
+              if (statusMessage.status === "compacting") setRuntimePhase("Claude: compacting");
+              if (statusMessage.compact_result === "failed") {
+                activity({
+                  kind: "error",
+                  title: "Claude context compaction failed",
+                  detail: statusMessage.compact_error,
+                  isError: true,
+                });
+              }
+            } else {
+              const systemMessage = message as any;
+              const label = systemMessage.summary ?? systemMessage.description ?? systemMessage.text;
+              if (label) setRuntimePhase(`Claude: ${summarize(label, 60)}`);
+            }
             continue;
           }
 
           if (message.type === "result") {
-            output.usage.input = message.usage.input_tokens ?? 0;
-            output.usage.output = message.usage.output_tokens ?? 0;
-            output.usage.cacheRead = message.usage.cache_read_input_tokens ?? 0;
-            output.usage.cacheWrite = message.usage.cache_creation_input_tokens ?? 0;
-            output.usage.totalTokens = output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
-            output.usage.cost.total = message.total_cost_usd ?? 0;
-            if (message.subtype !== "success") resultError = message.errors.join("\n") || message.subtype;
-            else if (!emittedText && message.result) {
-              const index = output.content.length;
-              output.content.push({ type: "text", text: message.result });
-              stream.push({ type: "text_start", contentIndex: index, partial: output });
-              stream.push({ type: "text_delta", contentIndex: index, delta: message.result, partial: output });
-              stream.push({ type: "text_end", contentIndex: index, content: message.result, partial: output });
-            }
+            run.events.push({ kind: "result", message });
+            continue;
           }
         }
+      } catch (error) {
+        run.events.push({ kind: "error", message: error instanceof Error ? error.message : String(error) });
+      } finally {
+        run.events.close();
+        for (const waiter of run.pendingResults.values()) {
+          waiter.resolve({
+            content: [{ type: "text", text: "The Claude runtime run ended before this tool result arrived." }],
+            details: undefined,
+            isError: true,
+          });
+        }
+        run.pendingResults.clear();
+      }
+    })();
+  };
 
-        if (resultError) throw new Error(resultError);
-        if (abortController.signal.aborted) throw new Error("Claude Agent SDK request aborted.");
+  const streamClaudeRuntime = (
+    model: Model<Api>,
+    context: Context,
+    options?: SimpleStreamOptions,
+  ): AssistantMessageEventStream => {
+    const stream = createAssistantMessageEventStream();
+    const output = makeOutput(model);
+
+    void (async () => {
+      const abort = () => activeRun?.abortController.abort();
+      options?.signal?.addEventListener("abort", abort, { once: true });
+      try {
+        const piSessionId = activeContext?.sessionManager.getSessionId() ?? "ephemeral";
+        const lastMessage = context.messages[context.messages.length - 1] as { role?: string } | undefined;
+        const continuing =
+          activeRun !== undefined &&
+          activeRun.piSessionId === piSessionId &&
+          !activeRun.abortController.signal.aborted &&
+          lastMessage?.role === "toolResult";
+
+        if (continuing) {
+          stream.push({ type: "start", partial: output });
+          setRuntimePhase("Claude: continuing");
+        } else {
+          if (activeRun) {
+            // A new user message arrived (steering or a fresh turn) while a run
+            // was still open; Claude session resume carries the context over.
+            activeRun.abortController.abort();
+            activeRun = undefined;
+          }
+          const userContent = lastUserContent(context);
+          const promptText = lastUserText(context);
+          if (userContent.length === 0) throw new Error("Claude Agent SDK requires a user prompt.");
+
+          const branch = activeContext?.sessionManager.getBranch() ?? [];
+          const currentUserEntry = [...branch].reverse().find(
+            (entry) => entry.type === "message" && entry.message.role === "user",
+          );
+          const bindingMatchesSession =
+            state.binding?.piSessionId === piSessionId && state.binding.cwd === (activeContext?.cwd ?? process.cwd());
+          if (state.binding && !bindingMatchesSession) {
+            state = { ...state, binding: undefined };
+          }
+
+          const range = getHandoffRange(
+            branch,
+            state.binding?.syncedThroughEntryId,
+            currentUserEntry?.id,
+          );
+          if (range.divergent) {
+            state = { ...state, binding: undefined, pendingHandoff: undefined };
+          }
+          // Rounds and tool results produced by the Claude runtime itself are
+          // already in Claude's own session; only foreign content needs a
+          // handoff. Judged on the raw range so a Pi-side compaction of pure
+          // Claude-runtime history does not masquerade as foreign content.
+          const needsHandoff = needsClaudeHandoff(range.rawMessages, PROVIDER);
+
+          let handoff: PendingHandoff | undefined = state.pendingHandoff;
+          if (!handoff && range.messages.length > 0 && needsHandoff) {
+            setRuntimePhase("Claude: preparing handoff");
+            handoff = {
+              kind: state.binding && !range.divergent ? "catch-up" : "bootstrap",
+              summary: await generateHandoffSummary(
+                activeContext!,
+                handoffSourceModel,
+                range.messages,
+                promptText,
+                options?.signal,
+              ),
+              throughEntryId: range.throughEntryId,
+            };
+            state = { ...state, pendingHandoff: handoff };
+            persistState();
+          }
+
+          const effectiveText = handoff
+            ? wrapHandoff(handoff.summary, handoff.kind, handoff.throughEntryId, promptText)
+            : promptText;
+          const effectiveContent = userContent.map((block, index) =>
+            block.type === "text" && index === userContent.findIndex((item) => item.type === "text")
+              ? { ...block, text: effectiveText }
+              : block,
+          );
+          if (!effectiveContent.some((block) => block.type === "text")) {
+            effectiveContent.unshift({ type: "text", text: effectiveText });
+          }
+          const hasImages = effectiveContent.some((block) => block.type === "image");
+          const prompt = hasImages
+            ? (async function* (): AsyncGenerator<SDKUserMessage> {
+                yield {
+                  type: "user",
+                  message: {
+                    role: "user",
+                    content: effectiveContent.map((block) =>
+                      block.type === "text"
+                        ? block
+                        : {
+                            type: "image" as const,
+                            source: {
+                              type: "base64" as const,
+                              media_type: block.mimeType as "image/gif" | "image/jpeg" | "image/png" | "image/webp",
+                              data: block.data,
+                            },
+                          },
+                    ),
+                  },
+                  parent_tool_use_id: null,
+                  session_id: "",
+                };
+              })()
+            : effectiveText;
+
+          stream.push({ type: "start", partial: output });
+          setRuntimePhase(state.binding ? "Claude: resuming" : "Claude: starting");
+
+          const run: ActiveRun = {
+            piSessionId,
+            abortController: new AbortController(),
+            events: new AsyncQueue<RunEvent>(),
+            pendingResults: new Map(),
+            earlyResults: new Map(),
+          };
+          activeRun = run;
+
+          const sdkQuery = query({
+            prompt,
+            options: {
+              cwd: activeContext?.cwd ?? process.cwd(),
+              model: model.id,
+              pathToClaudeCodeExecutable: binary,
+              systemPrompt: { type: "preset", preset: "claude_code" },
+              tools: { type: "preset", preset: "claude_code" },
+              settingSources: ["user", "project", "local"],
+              includePartialMessages: true,
+              forwardSubagentText: true,
+              abortController: run.abortController,
+              canUseTool,
+              ...(state.binding ? { resume: state.binding.claudeSessionId } : {}),
+              ...(state.permission === "full-access"
+                ? { permissionMode: "bypassPermissions", allowDangerouslySkipPermissions: true }
+                : { permissionMode: "default" }),
+              ...(effortFor(options?.reasoning) ? { effort: effortFor(options?.reasoning) } : {}),
+              ...(thinkingFor(model.id, options?.reasoning, options?.thinkingBudgets)
+                ? { thinking: thinkingFor(model.id, options?.reasoning, options?.thinkingBudgets) }
+                : {}),
+              env: {
+                ...process.env,
+                CLAUDE_AGENT_SDK_CLIENT_APP: "pi-claude-runtime/0.1.0",
+              },
+            },
+          });
+          pumpRun(run, sdkQuery as AsyncIterable<SDKMessage>, piSessionId);
+        }
+
+        const run = activeRun!;
+        const reason = await drainRound(run.events, output, stream, {
+          onPhase: setRuntimePhase,
+          aborted: () => run.abortController.signal.aborted || options?.signal?.aborted === true,
+        });
+
+        if (reason === "toolUse") {
+          // The handoff reached Claude's session; a steering restart must not resend it.
+          if (state.pendingHandoff) {
+            state = { ...state, pendingHandoff: undefined };
+            persistState();
+          }
+          output.stopReason = "toolUse";
+          stream.push({ type: "done", reason: "toolUse", message: output });
+          stream.end();
+          return;
+        }
+
+        activeRun = undefined;
         if (state.binding) {
+          const branch = activeContext?.sessionManager.getBranch() ?? [];
+          const currentUserEntry = [...branch].reverse().find(
+            (entry) => entry.type === "message" && entry.message.role === "user",
+          );
           state = {
             ...state,
             binding: {
@@ -487,7 +803,13 @@ export default function claudeRuntime(pi: ExtensionAPI) {
         stream.push({ type: "done", reason: "stop", message: output });
         stream.end();
       } catch (error) {
-        output.stopReason = abortController.signal.aborted ? "aborted" : "error";
+        const aborted =
+          options?.signal?.aborted === true || activeRun?.abortController.signal.aborted === true;
+        if (activeRun) {
+          activeRun.abortController.abort();
+          activeRun = undefined;
+        }
+        output.stopReason = aborted ? "aborted" : "error";
         output.errorMessage = error instanceof Error ? error.message : String(error);
         activity({ kind: "error", title: "Claude runtime failed", detail: output.errorMessage, isError: true });
         stream.push({ type: "error", reason: output.stopReason, error: output });
@@ -500,6 +822,69 @@ export default function claudeRuntime(pi: ExtensionAPI) {
 
     return stream;
   };
+
+  type ToolActivity = Extract<Activity, { kind: "tool" }>;
+
+  // The built-in edit tool recomputes its diff preview from the file on disk,
+  // but Claude Code has already applied the edit by the time this entry
+  // renders — the old text is gone, so that preview reports a bogus
+  // "Could not find the exact text" failure. Render the recorded outcome instead.
+  const recordedEditDiff = (data: ToolActivity): string | undefined => {
+    if (data.details?.structuredPatch?.length) {
+      return structuredPatchToDiffString(data.details.structuredPatch);
+    }
+    if (data.isError) return undefined;
+    // Entries recorded without a structured patch: approximate with a diff of
+    // the replaced block itself (line numbers are relative to the block).
+    const oldText = data.args.old_string;
+    const newText = data.args.new_string;
+    if (typeof oldText !== "string" || typeof newText !== "string") return undefined;
+    return generateDiffString(oldText, newText).diff;
+  };
+
+  const recordedEditDefinition = (data: ToolActivity): ToolDefinition<any, any> =>
+    ({
+      name: "edit",
+      label: "edit",
+      description: "Edit recorded from the Claude runtime",
+      parameters: undefined,
+      execute: async () => {
+        throw new Error("Recorded Claude runtime edits cannot be re-executed.");
+      },
+      renderShell: "default",
+      renderCall: (_args: unknown, theme: Theme) => {
+        const container = new Container();
+        container.addChild(
+          new Text(
+            `${theme.fg("toolTitle", theme.bold("edit"))} ${displayPath(data.args.file_path)}`,
+            0,
+            0,
+          ),
+        );
+        const diff = recordedEditDiff(data);
+        if (diff) {
+          container.addChild(new Spacer(1));
+          container.addChild(new Text(renderDiff(diff), 0, 0));
+        }
+        return container;
+      },
+      renderResult: (
+        result: { content: Array<{ type: string; text?: string }> },
+        _options: unknown,
+        theme: Theme,
+      ) => {
+        const container = new Container();
+        if (!data.isError) return container;
+        const text = result.content
+          .filter((block) => block.type === "text")
+          .map((block) => block.text ?? "")
+          .join("\n");
+        if (!text) return container;
+        container.addChild(new Spacer(1));
+        container.addChild(new Text(theme.fg("error", text), 0, 0));
+        return container;
+      },
+    }) as unknown as ToolDefinition<any, any>;
 
   pi.registerEntryRenderer<Activity>(ACTIVITY_ENTRY, (entry, { expanded }, theme) => {
     const data = entry.data;
@@ -518,7 +903,7 @@ export default function claudeRuntime(pi: ExtensionAPI) {
       data.toolUseId,
       mapped.args,
       { showImages: true },
-      undefined,
+      data.title === "Edit" ? recordedEditDefinition(data) : undefined,
       { requestRender: () => {} } as TUI,
       activeContext?.cwd ?? process.cwd(),
     );
@@ -558,6 +943,12 @@ export default function claudeRuntime(pi: ExtensionAPI) {
       };
       persistState();
     }
+    if (activeRun && activeRun.piSessionId !== ctx.sessionManager.getSessionId()) {
+      activeRun.abortController.abort();
+      activeRun = undefined;
+    }
+    for (const name of state.knownClaudeTools ?? []) registerProxy(name);
+    applyToolScope(ctx.model?.provider);
     setRuntimePhase("Claude: idle");
     void refreshVersion();
   });
@@ -567,6 +958,11 @@ export default function claudeRuntime(pi: ExtensionAPI) {
     if (event.model.provider === PROVIDER && event.previousModel?.provider !== PROVIDER) {
       handoffSourceModel = event.previousModel as Model<Api> | undefined;
     }
+    if (event.model.provider !== PROVIDER && activeRun) {
+      activeRun.abortController.abort();
+      activeRun = undefined;
+    }
+    applyToolScope(event.model.provider);
     publishRuntimeStatus();
   });
   pi.on("turn_end", (event, ctx) => {
@@ -589,6 +985,17 @@ export default function claudeRuntime(pi: ExtensionAPI) {
       binding: { ...state.binding, syncedThroughEntryId: assistantEntry.id },
     };
     persistState();
+  });
+  pi.on("session_before_compact", (event, ctx) => {
+    // While the Claude runtime is bound, Pi's context is never sent to an API —
+    // Claude Code manages (and compacts) its own session, and the usage we
+    // report reflects Claude's context, not Pi's. Threshold/overflow
+    // compactions triggered by those numbers would only spend tokens
+    // summarizing history Pi never transmits. Manual /compact stays honored.
+    if (event.reason !== "manual" && ctx.model?.provider === PROVIDER && state.binding) {
+      return { cancel: true };
+    }
+    return undefined;
   });
   pi.on("session_shutdown", (_event, ctx) => {
     ctx.ui.setStatus(STATUS_ID, undefined);
